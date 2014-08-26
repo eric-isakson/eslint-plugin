@@ -6,6 +6,7 @@ import com.eslint.utils.PsiUtil;
 import com.google.common.base.Joiner;
 import com.intellij.codeInspection.*;
 import com.intellij.execution.ExecutionException;
+import com.intellij.execution.OutputListener;
 import com.intellij.execution.Platform;
 import com.intellij.execution.configurations.GeneralCommandLine;
 import com.intellij.execution.process.*;
@@ -17,14 +18,19 @@ import com.intellij.notification.NotificationType;
 import com.intellij.openapi.actionSystem.CommonDataKeys;
 import com.intellij.openapi.actionSystem.DataContext;
 import com.intellij.openapi.application.AccessToken;
+import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.application.ModalityState;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.options.Configurable;
 import com.intellij.openapi.options.ex.SingleConfigurableEditor;
 import com.intellij.openapi.options.newEditor.OptionsEditor;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.Key;
+import com.intellij.openapi.util.ThrowableComputable;
 import com.intellij.openapi.util.text.StringUtil;
 import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiElement;
@@ -44,7 +50,7 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class ESLintInspection extends PropertySuppressableInspectionBase { // TODO this should just a be a LocalInspectionTool suppression needs other logic than what is in PropertySuppressableInspectionBase
+public class ESLintInspection extends PropertySuppressableInspectionBase {
 
     private static final Logger LOG = Logger.getInstance(ESLintBundle.LOG_ID);
 
@@ -76,97 +82,196 @@ public class ESLintInspection extends PropertySuppressableInspectionBase { // TO
         return commandLine;
     }
 
-    private static final Pattern pattern = Pattern.compile("^\\s+(\\d+):(\\d+)\\s+(\\S+)\\s+(.+)\\s+(\\S+)$");
+    private static final Pattern pattern = Pattern.compile(".*?^\\s+(\\d+):(\\d+)\\s+(\\S+)\\s+(.+?)\\s+(\\S+)$", Pattern.DOTALL | Pattern.MULTILINE);
+
+//    public void inspectionStarted(@org.jetbrains.annotations.NotNull com.intellij.codeInspection.LocalInspectionToolSession session, boolean isOnTheFly) {
+//        PsiFile file = session.getFile();
+//        final Document document = PsiDocumentManager.getInstance(file.getProject()).getDocument(file);
+//        if (document != null) {
+//            // make sure the PSI and the disk are in synch
+//            System.out.println("Synch'ing PSI to disk");
+//            ApplicationManager.getApplication().invokeAndWait(new Runnable() {
+//                @Override
+//                public void run() {
+//                    FileDocumentManager.getInstance().saveDocument(document);
+//                }
+//            }, ModalityState.NON_MODAL);
+//        }
+//        super.inspectionStarted(session, isOnTheFly);
+//    }
 
     public ProblemDescriptor[] checkFile(@NotNull final PsiFile file, @NotNull final InspectionManager manager, final boolean isOnTheFly) {
+        if (isOnTheFly) return null; // use the ExternalAnnotator instead which ensures the PSI and filesystem are in synch
+        if (!(file instanceof JSFileImpl)) return null;
+        ESLintProjectComponent component = file.getProject().getComponent(ESLintProjectComponent.class);
+        if (!component.isSettingsValid() || !component.isEnabled()) {
+            return null;
+        }
+        final Document document = PsiDocumentManager.getInstance(file.getProject()).getDocument(file);
+        if (document == null) {
+            component.showInfoNotification("Error running ESLint inspection: Could not get document for file " + file.getName(), NotificationType.WARNING);
+            return null;
+        }
+
+        final Application application = ApplicationManager.getApplication();
+
+        final ProblemsHolder problemsHolder = new ProblemsHolder(manager, file, isOnTheFly);
+        final GeneralCommandLine commandLine = getCommandLine((JSFileImpl)file, component);
+        final StringBuilder out = new StringBuilder();
+        final StringBuilder err = new StringBuilder();
+        OutputListener outputListener = new OutputListener(out,err);
         try {
-            if (!(file instanceof JSFileImpl)) return null;
-            ESLintProjectComponent component = file.getProject().getComponent(ESLintProjectComponent.class);
-            if (!component.isSettingsValid() || !component.isEnabled()) {
-                return null;
-            }
-
-            final Document document = PsiDocumentManager.getInstance(file.getProject()).getDocument(file);
-            if (document == null) {
-                component.showInfoNotification("Error running ESLint inspection: Could not get document for file " + file.getName(), NotificationType.WARNING);
-                return null;
-            }
-
-            final ProblemsHolder problemsHolder = new ProblemsHolder(manager, file, isOnTheFly);
-            final GeneralCommandLine commandLine = getCommandLine((JSFileImpl)file, component);
-            final StringBuilder err = new StringBuilder();
+            Process process = commandLine.createProcess();
+            ProcessHandler processHandler = new OSProcessHandler(process, commandLine.getCommandLineString());
+            processHandler.addProcessListener(outputListener);
+            processHandler.startNotify();
+            processHandler.waitFor();
+            AccessToken readLock = application.acquireReadActionLock();
             try {
-                Process process = commandLine.createProcess();
-                ProcessHandler processHandler = new OSProcessHandler(process, commandLine.getCommandLineString());
-                processHandler.addProcessListener(new ProcessAdapter() {
-                    @Override
-                    public void onTextAvailable(ProcessEvent event, Key outputType) {
-                        if (outputType == ProcessOutputTypes.STDERR) {
-                             err.append(event.getText());
-                        }
-                        else if (outputType == ProcessOutputTypes.SYSTEM) {
-                             // skip
-                        }
-                        else {
-                            Matcher matcher = pattern.matcher(event.getText());
-                            if (matcher.find()) {
-                                int line = Integer.parseInt(matcher.group(1));
-                                int column = Integer.parseInt(matcher.group(2));
-                                String level = matcher.group(3);
-                                String message = matcher.group(4);
-                                String rule = matcher.group(5);
-                                int offset = StringUtil.lineColToOffset(document.getText(), line - 1, column);
-                                if (LOG.isDebugEnabled()) LOG.debug("+ " + message + " " + line + ":" + column + " " + offset);
+                Matcher matcher = pattern.matcher(out.toString());
+                while (matcher.find()) {
+                    int line = Integer.parseInt(matcher.group(1));
+                    int column = Integer.parseInt(matcher.group(2));
+                    String level = matcher.group(3);
+                    String message = matcher.group(4);
+                    String rule = matcher.group(5);
+                    int offset = StringUtil.lineColToOffset(document.getText(), line - 1, column);
+                    if (LOG.isDebugEnabled())
+                        LOG.debug("+ " + message + " " + line + ":" + column + " " + offset);
 
-                                LocalQuickFix fix = Fixes.getFixForRule(rule);
+                    LocalQuickFix fix = Fixes.getFixForRule(rule);
 
-                                final AccessToken readAccessToken = ApplicationManager.getApplication().acquireReadActionLock();
-                                try {
-                                    PsiElement lit = PsiUtil.getElementAtOffset(file, offset);
-                                    if (LOG.isDebugEnabled()) LOG.debug("+ " + lit.getText());
-                                    ProblemDescriptor problem = manager.createProblemDescriptor(
-                                            lit,
-                                            ESLintBundle.message("eslint.property.inspection.message", message.trim(), rule),
-                                            fix,
-                                            level.equals("error") ? ProblemHighlightType.ERROR :
-                                                    ProblemHighlightType.GENERIC_ERROR_OR_WARNING, isOnTheFly);
+                    PsiElement lit = PsiUtil.getElementAtOffset(file, offset);
+                    if (LOG.isDebugEnabled()) LOG.debug("+ " + lit.getText());
+                    ProblemDescriptor problem = manager.createProblemDescriptor(
+                            lit,
+                            ESLintBundle.message("eslint.property.inspection.message", message.trim(), rule),
+                            fix,
+                            level.equals("error") ? ProblemHighlightType.ERROR :
+                                    ProblemHighlightType.GENERIC_ERROR_OR_WARNING, isOnTheFly);
 
-                                    problemsHolder.registerProblem(problem);
-                                }
-                                finally {
-                                    readAccessToken.finish();
-                                }
-                            }
-                        }
-                    }
-                });
-                processHandler.startNotify();
-                processHandler.waitFor();
-
-                if (process.exitValue() != 0 && !problemsHolder.hasResults()) {
-                    // this is the condition that node was started but something went wrong either in the node code
-                    // or the module resolution, report the errors to the user through a notification and log it
-                    component.showInfoNotification(err.toString(), NotificationType.ERROR);
-                    LOG.error(err.toString());
+                    problemsHolder.registerProblem(problem);
                 }
             }
-            catch (ExecutionException e) {
-                String message = new StringBuilder("Error running ESLint inspection: ").append(e.getMessage()).append("\ncwd: ").append(commandLine.getWorkDirectory().getAbsolutePath()).append("\ncommand: ").append(commandLine.getPreparedCommandLine(Platform.current())).toString();
-                LOG.error(message, e);
-                ESLintProjectComponent.showNotification(message, NotificationType.ERROR);
+            finally {
+                readLock.finish();
             }
-            return problemsHolder.getResultsArray();
-        } catch (Exception e) { // TODO do we really need this block?
-            e.printStackTrace();
-            LOG.error("Error running ESLint inspection: ", e);
-            System.out.println(e.getLocalizedMessage());
-            System.out.println(e.getMessage());
-            System.out.println(e.getStackTrace());
-            ESLintProjectComponent.showNotification("Error running ESLint inspection: " + e.getMessage(), NotificationType.ERROR);
+
+            if (process.exitValue() != 0 && !problemsHolder.hasResults()) {
+                // this is the condition that node was started but something went wrong either in the node code
+                // or the module resolution, report the errors to the user through a notification and log it
+                throw new ExecutionException(err.toString());
+            }
         }
-        return null;
+        catch (ExecutionException e) {
+            String message = new StringBuilder("Error running ESLint inspection: ").append(e.getMessage()).append("\ncwd: ").append(commandLine.getWorkDirectory().getAbsolutePath()).append("\ncommand: ").append(commandLine.getPreparedCommandLine(Platform.current())).toString();
+            LOG.error(message, e);
+            ESLintProjectComponent.showNotification(message, NotificationType.ERROR);
+        }
+
+        return problemsHolder.getResultsArray();
     }
 
+// TODO investigate this approach which processes the output as it is created rather than buffering all the output - had deadlock issue when code was being edited that needs to be worked out.
+//    public ProblemDescriptor[] checkFile(@NotNull final PsiFile file, @NotNull final InspectionManager manager, final boolean isOnTheFly) {
+//        if (!(file instanceof JSFileImpl)) return null;
+//        ESLintProjectComponent component = file.getProject().getComponent(ESLintProjectComponent.class);
+//        if (!component.isSettingsValid() || !component.isEnabled()) {
+//            return null;
+//        }
+//
+//        final Document document = PsiDocumentManager.getInstance(file.getProject()).getDocument(file);
+//        if (document == null) {
+//            component.showInfoNotification("Error running ESLint inspection: Could not get document for file " + file.getName(), NotificationType.WARNING);
+//            return null;
+//        }
+//
+//        final ProblemsHolder problemsHolder = new ProblemsHolder(manager, file, isOnTheFly);
+//        final GeneralCommandLine commandLine = getCommandLine((JSFileImpl)file, component);
+//        final StringBuilder err = new StringBuilder();
+//        try {
+//            // wrap the process in a read action since we are accessing the file -- TODO is this safe? could the PSI be out of synch with the filesystem?
+//            return ApplicationManager.getApplication().runReadAction(new ThrowableComputable<ProblemDescriptor[], ExecutionException>() {
+//                @Override
+//                public ProblemDescriptor[] compute() throws ExecutionException {
+//                    Process process = commandLine.createProcess();
+//                    ProcessHandler processHandler = new OSProcessHandler(process, commandLine.getCommandLineString());
+//                    processHandler.addProcessListener(new ProcessAdapter() {
+//                        @Override
+//                        public void startNotified(ProcessEvent event) {
+//                            super.startNotified(event);
+//                        }
+//
+//                        @Override
+//                        public void processTerminated(ProcessEvent event) {
+//                            super.processTerminated(event);
+//                        }
+//
+//                        @Override
+//                        public void onTextAvailable(ProcessEvent event, Key outputType) {
+//                            if (outputType == ProcessOutputTypes.STDERR) {
+//                                err.append(event.getText());
+//                            }
+//                            else if (outputType == ProcessOutputTypes.SYSTEM) {
+//                                // skip
+//                            }
+//                            else {
+//                                final String text = event.getText();
+//                                // work inside a read action since the process is running in the job scheduler pooled thread
+//                                ApplicationManager.getApplication().runReadAction(new Computable<Void>() {
+//                                    @Override
+//                                    public Void compute() {
+//                                        Matcher matcher = pattern.matcher(text);
+//                                        if (matcher.find()) {
+//                                            int line = Integer.parseInt(matcher.group(1));
+//                                            int column = Integer.parseInt(matcher.group(2));
+//                                            String level = matcher.group(3);
+//                                            String message = matcher.group(4);
+//                                            String rule = matcher.group(5);
+//                                            int offset = StringUtil.lineColToOffset(document.getText(), line - 1, column);
+//                                            if (LOG.isDebugEnabled()) LOG.debug("+ " + message + " " + line + ":" + column + " " + offset);
+//
+//                                            LocalQuickFix fix = Fixes.getFixForRule(rule);
+//
+//                                            PsiElement lit = PsiUtil.getElementAtOffset(file, offset);
+//                                            if (LOG.isDebugEnabled()) LOG.debug("+ " + lit.getText());
+//                                            ProblemDescriptor problem = manager.createProblemDescriptor(
+//                                                    lit,
+//                                                    ESLintBundle.message("eslint.property.inspection.message", message.trim(), rule),
+//                                                    fix,
+//                                                    level.equals("error") ? ProblemHighlightType.ERROR :
+//                                                            ProblemHighlightType.GENERIC_ERROR_OR_WARNING, isOnTheFly);
+//
+//                                            problemsHolder.registerProblem(problem);
+//                                        }
+//                                        return null;
+//                                    }
+//                                });
+//                            }
+//                        }
+//                    });
+//                    processHandler.startNotify();
+//                    processHandler.waitFor();
+//
+//                    if (process.exitValue() != 0 && !problemsHolder.hasResults()) {
+//                        // this is the condition that node was started but something went wrong either in the node code
+//                        // or the module resolution, report the errors to the user through a notification and log it
+//                        throw new ExecutionException(err.toString());
+//                    }
+//
+//                    return problemsHolder.getResultsArray();
+//                }
+//            });
+//        }
+//        catch (ExecutionException e) {
+//            String message = new StringBuilder("Error running ESLint inspection: ").append(e.getMessage()).append("\ncwd: ").append(commandLine.getWorkDirectory().getAbsolutePath()).append("\ncommand: ").append(commandLine.getPreparedCommandLine(Platform.current())).toString();
+//            LOG.error(message, e);
+//            ESLintProjectComponent.showNotification(message, NotificationType.ERROR);
+//        }
+//
+//        return null;
+//    }
+//
     public JComponent createOptionsPanel() {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         HyperlinkLabel settingsLink = createHyperLink();
