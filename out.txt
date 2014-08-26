@@ -1,0 +1,13 @@
+C:/dev/eslint-plugin-test/valid-jsdoc.js
+  12:4  error    'alert' is not defined          no-undef
+  15:4  error    'alert' is not defined          no-undef
+  40:4  error    'alert' is not defined          no-undef
+  45:4  error    'alert' is not defined          no-undef
+  55:0  error    'alert' is not defined          no-undef
+  56:0  error    'alert' is not defined          no-undef
+   6:0  error    Missing "use strict" statement  strict
+  19:0  error    Missing "use strict" statement  strict
+  26:1  warning  Unnecessary semicolon           no-extra-semi
+
+? 9 problems
+

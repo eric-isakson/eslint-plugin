@@ -45,6 +45,10 @@ import org.jetbrains.annotations.NotNull;
 import javax.swing.*;
 import javax.swing.event.HyperlinkEvent;
 import java.awt.*;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -64,7 +68,7 @@ public class ESLintInspection extends PropertySuppressableInspectionBase {
         return "ESLintInspection";
     }
 
-    private GeneralCommandLine getCommandLine(JSFileImpl file, ESLintProjectComponent component) {
+    private GeneralCommandLine getCommandLine(String workingDirectory, String filepath, ESLintProjectComponent component) {
         List<String> command = new ArrayList<String>();
         command.add(component.nodeInterpreter);
         command.add(component.eslintExecutable);
@@ -76,9 +80,9 @@ public class ESLintInspection extends PropertySuppressableInspectionBase {
             command.add("--rulesdir");
             command.add(new StringBuilder("['").append(component.rulesPath).append("']").toString());
         }
-        command.add(file.getVirtualFile().getPath());
+        command.add(filepath);
         GeneralCommandLine commandLine = new GeneralCommandLine(command);
-        commandLine.setWorkDirectory(file.getProject().getBasePath());
+        commandLine.setWorkDirectory(workingDirectory);
         return commandLine;
     }
 
@@ -100,8 +104,17 @@ public class ESLintInspection extends PropertySuppressableInspectionBase {
 //        super.inspectionStarted(session, isOnTheFly);
 //    }
 
+    private static File writeToTmpFile(String filename, String text)
+            throws IOException {
+        File tmpFile = File.createTempFile(filename,".js");
+        FileWriter fileWriter = new FileWriter(tmpFile);
+        BufferedWriter bw = new BufferedWriter(fileWriter);
+        bw.write(text.toString());
+        bw.close();
+        return tmpFile;
+    }
+
     public ProblemDescriptor[] checkFile(@NotNull final PsiFile file, @NotNull final InspectionManager manager, final boolean isOnTheFly) {
-        if (isOnTheFly) return null; // use the ExternalAnnotator instead which ensures the PSI and filesystem are in synch
         if (!(file instanceof JSFileImpl)) return null;
         ESLintProjectComponent component = file.getProject().getComponent(ESLintProjectComponent.class);
         if (!component.isSettingsValid() || !component.isEnabled()) {
@@ -116,7 +129,28 @@ public class ESLintInspection extends PropertySuppressableInspectionBase {
         final Application application = ApplicationManager.getApplication();
 
         final ProblemsHolder problemsHolder = new ProblemsHolder(manager, file, isOnTheFly);
-        final GeneralCommandLine commandLine = getCommandLine((JSFileImpl)file, component);
+
+        File tmpFile = null;
+        String filepath;
+        try {
+            if (isOnTheFly) {
+                // ensure the PSI and filesystem are in synch by writing the PSI to a temp file and processing that
+                // unable to write the document back to its location because the inspection is run in a read-action
+                // so attempting a write action here can cause a deadlock
+                tmpFile = writeToTmpFile(file.getName(), file.getText());
+                filepath = tmpFile.getAbsolutePath();
+            } else {
+                filepath = file.getVirtualFile().getPath();
+            }
+        }
+        catch (IOException e) {
+            String message = new StringBuilder("Error running ESLint inspection: Unable to create temporary file: ").append(e.getMessage()).toString();
+            LOG.error(message, e);
+            ESLintProjectComponent.showNotification(message, NotificationType.ERROR);
+            return null;
+        }
+
+        final GeneralCommandLine commandLine = getCommandLine(file.getProject().getBasePath(), filepath, component);
         final StringBuilder out = new StringBuilder();
         final StringBuilder err = new StringBuilder();
         OutputListener outputListener = new OutputListener(out,err);
@@ -167,6 +201,11 @@ public class ESLintInspection extends PropertySuppressableInspectionBase {
             String message = new StringBuilder("Error running ESLint inspection: ").append(e.getMessage()).append("\ncwd: ").append(commandLine.getWorkDirectory().getAbsolutePath()).append("\ncommand: ").append(commandLine.getPreparedCommandLine(Platform.current())).toString();
             LOG.error(message, e);
             ESLintProjectComponent.showNotification(message, NotificationType.ERROR);
+        }
+        finally {
+            if (tmpFile != null) {
+                tmpFile.delete();
+            }
         }
 
         return problemsHolder.getResultsArray();
